@@ -1217,6 +1217,8 @@ void Symbol::addLoc(const core::GlobalState &gs, core::Loc loc) {
 
     if (loc.file().data(gs).sourceType == core::File::Type::Normal && !loc.file().data(gs).isRBI()) {
         locs_.insert(locs_.begin(), loc);
+    } else if (!locs_.empty() && loc.file().data(gs).strictLevel > locs_[0].file.data(gs).strictLevel) {
+        locs_.insert(locs_.begin(), loc);
     } else {
         locs_.emplace_back(loc);
     }
