@@ -15,22 +15,6 @@ module T::Props
       ValidateProc = T.type_alias { T.proc.params(prop: Symbol, value: T.untyped).void }
 
       sig do
-        params(prop: Symbol, rules: T::Hash[Symbol, T.untyped])
-          .returns([SetterProc, BoundSetterProc])
-          .checked(:never)
-      end
-      def self.wrap_lazy_enum_setter(prop, rules)
-        original = rules.fetch(:_bound_setter_proc)
-        bound = proc do |instance, val|
-          result = original.call(instance, val)
-          state = instance.instance_variable_get(:@_lazy_enum_values)
-          state&.delete(prop)
-          result
-        end
-        [proc { |val| bound.call(self, val) }, bound]
-      end
-
-      sig do
         params(
           klass: T.all(T::Module[T.anything], T::Props::ClassMethods),
           prop: Symbol,

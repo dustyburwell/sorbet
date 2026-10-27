@@ -129,8 +129,12 @@ class Opus::Types::Test::Props::DecoratorTest < Critic::Unit::UnitTest
   describe 'deferred enum accessors' do
     it 'regenerates only runtime-defined accessors when an inherited prop becomes eligible' do
       assert_raises(KeyError) { EagerInheritedEnumParent.from_hash('value' => 'unknown') }
-      doc = DeferredInheritedEnumChild.from_hash('value' => 'unknown')
+      doc = Class.new(DeferredInheritedEnumChild).from_hash('value' => 'unknown')
       assert_raises(KeyError) { doc.value }
+      doc.deserialize('value' => 'known')
+      assert_same(AccessorEnum::Known, doc.value)
+      assert_same(AccessorEnum::Known, doc.class.decorator.prop_get(doc, :value))
+      doc.deserialize('value' => 'unknown')
       doc.value = AccessorEnum::Known
       assert_same(AccessorEnum::Known, doc.value)
       assert_equal('known', doc.serialize.fetch('value'))
@@ -138,6 +142,8 @@ class Opus::Types::Test::Props::DecoratorTest < Critic::Unit::UnitTest
       setter = doc.class.decorator.props_without_defaults.fetch(:value)
       setter.call(doc, AccessorEnum::Known)
       assert_same(AccessorEnum::Known, doc.value)
+      assert_same(AccessorEnum::Known, doc.class.decorator.prop_get(doc, :value))
+      assert_empty(doc.instance_variable_get(:@_lazy_enum_values))
     end
 
     it 'preserves a user-defined getter while dynamic reads remain typed' do
@@ -172,15 +178,6 @@ class Opus::Types::Test::Props::DecoratorTest < Critic::Unit::UnitTest
       doc = klass.from_hash('value' => 'unknown')
       assert_raises(RuntimeError) { doc.value = AccessorEnum::Known }
       assert_equal('unknown', doc.serialize.fetch('value'))
-    end
-
-    it 'uses the same resolver for inherited direct and dynamic access' do
-      klass = Class.new(EnumAccessorChild)
-      doc = klass.from_hash('value' => 'known')
-      assert_same(AccessorEnum::Known, doc.value)
-      assert_same(AccessorEnum::Known, klass.decorator.prop_get(doc, :value))
-      doc.value = AccessorEnum::Known
-      assert_empty(doc.instance_variable_get(:@_lazy_enum_values))
     end
   end
 

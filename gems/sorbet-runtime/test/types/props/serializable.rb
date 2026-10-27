@@ -1463,13 +1463,14 @@ class Opus::Types::Test::Props::SerializableTest < Critic::Unit::UnitTest
     end
 
     it 'invalidates pending and resolved values only after successful writes on every setter path' do
-      %i[generated dynamic bound].each do |path|
+      %i[generated dynamic bound cached].each do |path|
         doc = DeferredEnumDocument.from_hash('stored' => 'unknown')
         write = lambda do |value|
           case path
           when :generated then doc.required = value
           when :dynamic then doc.class.decorator.prop_set(doc, :required, value)
           when :bound then doc.class.decorator.prop_rules(:required).fetch(:_bound_setter_proc).call(doc, value)
+          when :cached then doc.class.decorator.props_without_defaults.fetch(:required).call(doc, value)
           end
         end
         assert_raises(TypeError) { write.call('invalid') }
@@ -1484,14 +1485,7 @@ class Opus::Types::Test::Props::SerializableTest < Critic::Unit::UnitTest
       end
     end
 
-    it 'invalidates pending values through cached constructor setters' do
-      doc = DeferredEnumDocument.from_hash('stored' => 'unknown')
-      setter = doc.class.decorator.props_without_defaults.fetch(:required)
-      assert_raises(TypeError) { setter.call(doc, 'invalid') }
-      assert_equal('unknown', doc.serialize.fetch('stored'))
-      setter.call(doc, DeferredEnum::One)
-      assert_same(DeferredEnum::One, doc.required)
-
+    it 'invalidates pending values through cached default setters' do
       defaults = DeferredEnumDefaults.from_hash('defaulted' => 'unknown')
       setter = defaults.class.decorator.props_with_defaults.fetch(:defaulted).bound_setter_proc
       assert_raises(TypeError) { setter.call(defaults, 'invalid') }

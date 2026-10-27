@@ -79,18 +79,16 @@ module T::Props
         state, has_prop = condition.children
         assert_equal(s(:ivar, :@_lazy_enum_values), state)
         assert_equal(:send, has_prop.type)
-        receiver, method, prop = has_prop.children
-        assert_equal(state, receiver)
-        assert_equal(:key?, method)
+        prop = has_prop.children[2]
         assert_equal(:sym, prop.type)
         assert_equal(s(:send, state, :key?, prop), has_prop)
         assert_equal(:send, if_body.type)
-        hash, assign, key, value = if_body.children
-        assert_equal(s(:lvar, :h), hash)
-        assert_equal(:[]=, assign)
+        key = if_body.children[2]
         assert_equal(:str, key.type)
-        assert_equal(s(:send, nil, :__t_props_serialize_lazy_enum, prop), value)
-        assert_equal(s(:send, s(:lvar, :h), :[]=, key, value), if_body)
+        assert_equal(
+          s(:send, s(:lvar, :h), :[]=, key, s(:send, nil, :__t_props_serialize_lazy_enum, prop)),
+          if_body,
+        )
         validate_serialize_clause(else_body)
         return
       end
@@ -179,19 +177,14 @@ module T::Props
         lazy_condition, lazy_body, eager_body = else_body.children
         assert_equal(s(:ivar, :@_lazy_enum_values), lazy_condition)
         assert_equal(:send, lazy_body.type)
-        receiver, method, prop, value = lazy_body.children
-        assert_equal(nil, receiver)
-        assert_equal(:__t_props_store_lazy_enum, method)
+        prop = lazy_body.children[2]
         assert_equal(:sym, prop.type)
-        assert_equal(s(:lvar, :val), value)
-        assert_equal(s(:send, nil, :__t_props_store_lazy_enum, prop, value), lazy_body)
+        assert_equal(s(:send, nil, :__t_props_store_lazy_enum, prop, s(:lvar, :val)), lazy_body)
         # Only scalar enum deserialization has this clause.
         assert_equal(:send, eager_body.type)
-        enum, deserialize, raw = eager_body.children
+        enum = eager_body.children[0]
         assert_equal(:const, enum.type)
-        assert_equal(:deserialize, deserialize)
-        assert_equal(s(:lvar, :val), raw)
-        assert_equal(s(:send, enum, :deserialize, raw), eager_body)
+        assert_equal(s(:send, enum, :deserialize, s(:lvar, :val)), eager_body)
       elsif else_body.type == :kwbegin
         rescue_expression, = else_body.children
         assert_equal(:rescue, rescue_expression.type)
