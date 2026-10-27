@@ -51,6 +51,8 @@ module T::Props::Optional::DecoratorMethods
   attr_reader :props_without_defaults
 
   def add_prop_definition(prop, rules)
+    # Constructor caches must retain the same state-invalidating setters as rules.
+    prepare_lazy_enum_rules(prop, rules)
     compute_derived_rules(rules)
 
     default_setter = T::Props::Private::ApplyDefault.for(decorated_class, rules)

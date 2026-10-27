@@ -71,6 +71,8 @@ class T::Props::Decorator
       raise ArgumentError.new("Attempted to redefine prop #{name.inspect} on class #{@class} that's already defined without specifying :override => true: #{prop_rules(name)}")
     end
 
+    prepare_lazy_enum_rules(name, rules)
+
     # dup/store/freeze rather than @props.merge(name => rules.freeze).freeze:
     # merge would allocate a temporary single-entry Hash and re-insert every
     # existing entry. The published hash stays frozen between adds.
@@ -111,6 +113,56 @@ class T::Props::Decorator
   sig { returns(DecoratedClassType).checked(:never) }
   def decorated_class
     @class
+  end
+
+  sig { params(name: Symbol, rules: Rules).void.checked(:never) }
+  private def prepare_lazy_enum_rules(name, rules)
+    type = T::Utils::Nilable.get_underlying_type_object(rules.fetch(:type_object))
+    rules[:_lazy_enum] = supports_lazy_enum_deserialization? && type.is_a?(T::Types::Simple) &&
+                         type.raw_type.is_a?(Class) && !!(type.raw_type < T::Enum)
+    if rules[:_lazy_enum] && !rules[:_lazy_enum_setter]
+      setter, bound_setter = T::Props::Private::SetterFactory.wrap_lazy_enum_setter(name, rules)
+      rules[:setter_proc] = setter.freeze
+      rules[:_bound_setter_proc] = bound_setter.freeze
+      rules[:_lazy_enum_setter] = true
+    end
+  end
+
+  # Internal extension points. Eligibility is fixed when props are defined;
+  # the load policy is sampled once per deserialization, never by getters.
+  sig { returns(T::Boolean).checked(:never) }
+  def supports_lazy_enum_deserialization?
+    false
+  end
+
+  sig { params(instance: DecoratedInstance).returns(T::Boolean).checked(:never) }
+  def lazy_enum_deserialization?(instance)
+    false
+  end
+
+  sig { params(instance: DecoratedInstance, prop: T.any(String, Symbol), rules: Rules).returns(T.untyped).checked(:never) }
+  def lazy_enum_get(instance, prop, rules)
+    state = instance.instance_variable_get(:@_lazy_enum_values)
+    entry = state && state[prop.to_sym]
+    return instance.instance_variable_get(rules.fetch(:accessor_key)) unless entry
+    return entry[1] if entry.size == 2
+
+    type = T::Utils::Nilable.get_underlying_type_object(rules.fetch(:type_object))
+    begin
+      value = T.unsafe(type).raw_type.deserialize(entry[0])
+    rescue KeyError => e
+      raise KeyError.new("Error deserializing #{instance.class}##{prop}: #{e.message}")
+    end
+    # Publish an immutable entry in one operation, without changing the instance.
+    state[prop.to_sym] = [entry[0], value].freeze
+    value
+  end
+
+  sig { params(instance: DecoratedInstance, prop: Symbol).returns(T::Boolean).checked(:never) }
+  def lazy_enum_pending?(instance, prop)
+    state = instance.instance_variable_get(:@_lazy_enum_values)
+    entry = state && state[prop]
+    !!entry && entry.size == 1
   end
 
   # Accessors
@@ -184,7 +236,11 @@ class T::Props::Decorator
   def prop_get(instance, prop, rules=prop_rules(prop))
     # `instance_variable_get` will return nil if the variable doesn't exist
     # which is what we want to have happen for the logic below.
-    val = instance.instance_variable_get(rules[:accessor_key])
+    val = if rules[:_lazy_enum]
+      lazy_enum_get(instance, prop, rules)
+    else
+      instance.instance_variable_get(rules[:accessor_key])
+    end
     if !val.nil?
       val
     elsif (d = rules[:ifunset])
@@ -206,7 +262,11 @@ class T::Props::Decorator
   def prop_get_if_set(instance, prop, rules=prop_rules(prop))
     # `instance_variable_get` will return nil if the variable doesn't exist
     # which is what we want to have happen for the return value here.
-    instance.instance_variable_get(rules[:accessor_key])
+    if rules[:_lazy_enum]
+      lazy_enum_get(instance, prop, rules)
+    else
+      instance.instance_variable_get(rules[:accessor_key])
+    end
   end
   alias_method :get, :prop_get_if_set # Alias for backwards compatibility
 
@@ -452,7 +512,7 @@ class T::Props::Decorator
 
       end
 
-      if method(:prop_get).owner != T::Props::Decorator || rules.key?(:ifunset)
+      if method(:prop_get).owner != T::Props::Decorator || rules.key?(:ifunset) || rules[:_lazy_enum]
         d = @class.decorator
         @class.send(:define_method, name) do
           d.prop_get(self, name, rules)
@@ -552,15 +612,16 @@ class T::Props::Decorator
       # (b) it's safe because the getter was defined by this file.
       #
       unless rules[:without_accessors]
-        if clobber_getters && child.instance_method(name).source_location&.first == __FILE__
+        if (clobber_getters || copied_rules[:_lazy_enum] != rules[:_lazy_enum]) && child.instance_method(name).source_location&.first == __FILE__
           child.send(:define_method, name) do
-            T.unsafe(self.class).decorator.prop_get(self, name, rules)
+            T.unsafe(self.class).decorator.prop_get(self, name, copied_rules)
           end
         end
 
-        if !rules[:immutable] && clobber_setters && child.instance_method("#{name}=").source_location&.first == __FILE__
+        if !rules[:immutable] && (clobber_setters || copied_rules[:_lazy_enum] != rules[:_lazy_enum]) &&
+           [__FILE__, File.expand_path('private/setter_factory.rb', __dir__)].include?(child.instance_method("#{name}=").source_location&.first)
           child.send(:define_method, "#{name}=") do |val|
-            T.unsafe(self.class).decorator.prop_set(self, name, val, rules)
+            T.unsafe(self.class).decorator.prop_set(self, name, val, copied_rules)
           end
         end
       end

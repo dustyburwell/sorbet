@@ -1343,6 +1343,261 @@ class Opus::Types::Test::Props::SerializableTest < Critic::Unit::UnitTest
     )
   end
 
+  class DeferredEnum < T::Enum
+    enums do
+      One = new('one')
+      Two = new('two')
+    end
+  end
+
+  module DeferredEnums
+    include T::Props::Plugin
+
+    module DecoratorMethods
+      attr_accessor :eager_enums
+
+      def supports_lazy_enum_deserialization?
+        true
+      end
+
+      def lazy_enum_deserialization?(instance)
+        !eager_enums
+      end
+    end
+  end
+
+  class DeferredEnumDocument < T::InexactStruct
+    include DeferredEnums
+    EnumAlias = T.type_alias { T.nilable(DeferredEnum) }
+
+    prop :required, DeferredEnum, name: 'stored'
+    prop :optional, EnumAlias
+    prop :hidden, T.nilable(DeferredEnum), without_accessors: true
+    prop :label, String, default: 'label'
+  end
+
+  class DeferredEnumDefaults < T::Struct
+    include DeferredEnums
+    prop :defaulted, DeferredEnum, default: DeferredEnum::One
+    prop :factory, DeferredEnum, factory: -> { DeferredEnum::Two }
+    prop :optional, T.nilable(DeferredEnum), default: DeferredEnum::One
+    prop :missing, T.nilable(DeferredEnum), raise_on_nil_write: true
+  end
+
+  class DeferredEnumParent < T::Struct
+    prop :children, T::Array[DeferredEnumDocument]
+    prop :by_name, T::Hash[String, DeferredEnumDocument]
+  end
+
+  class EagerEnumContainers < T::Struct
+    include DeferredEnums
+    prop :array, T::Array[DeferredEnum]
+    prop :mapping, T::Hash[String, DeferredEnum]
+    prop :union, T.any(DeferredEnum, String)
+  end
+
+  describe 'internal deferred enum deserialization' do
+    after do
+      DeferredEnumDocument.decorator.eager_enums = false
+    end
+
+    it 'defers conversion until direct or dynamic access and memoizes on frozen objects' do
+      DeferredEnum.expects(:deserialize).never
+      doc = DeferredEnumDocument.from_hash!('stored' => 'one')
+      assert_nil(doc.instance_variable_get(:@required))
+      assert_equal({'stored' => 'one', 'label' => 'label'}, doc.serialize)
+      DeferredEnum.unstub(:deserialize)
+      DeferredEnum.expects(:deserialize).with('one').once.returns(DeferredEnum::One)
+      doc.freeze
+      assert_same(DeferredEnum::One, doc.required)
+      assert_same(DeferredEnum::One, doc.required)
+      assert_same(DeferredEnum::One, doc.class.decorator.prop_get(doc, :required))
+      assert_same(DeferredEnum::One, doc.class.decorator.get(doc, :required))
+      assert_equal('one', doc.serialize.fetch('stored'))
+      assert_nil(doc.instance_variable_get(:@required))
+    end
+
+    it 'preserves unknown values through serialization and unrelated writes, with fresh errors at each read' do
+      doc = DeferredEnumDocument.from_hash!('stored' => 'unknown', 'optional' => 'unknown', 'hidden' => 'unknown')
+      doc.label = 'changed'
+      assert_equal('changed', doc.label)
+      first = assert_raises(KeyError) { doc.required }
+      second = assert_raises(KeyError) { doc.required }
+      refute_same(first, second)
+      assert_includes(first.message, 'DeferredEnumDocument#required')
+      assert_raises(KeyError) { doc.class.decorator.prop_get(doc, :optional) }
+      assert_raises(KeyError) { doc.class.decorator.get(doc, :hidden) }
+      assert_equal({'stored' => 'unknown', 'optional' => 'unknown', 'hidden' => 'unknown', 'label' => 'changed'}, doc.serialize)
+      assert_empty(doc.class.decorator.extra_props(doc))
+    end
+
+    it 'copies retained strings and never exposes them through inspection' do
+      raw = +'unknown'
+      doc = DeferredEnumDocument.from_hash('stored' => raw)
+      raw.replace('changed')
+      serialized = doc.serialize
+      serialized['stored'].replace('also changed')
+      assert_equal('unknown', doc.serialize.fetch('stored'))
+      DeferredEnum.expects(:deserialize).never
+      assert_includes(doc.inspect, 'required=<pending enum>')
+      refute_includes(doc.inspect, 'unknown')
+      refute_includes(doc.pretty_inspect, 'unknown')
+    end
+
+    it 'preserves redaction without passing pending raw values to custom inspection callbacks' do
+      klass = Class.new(DeferredEnumDocument) do
+        def self.contains_pii?
+          true
+        end
+
+        prop :secret, T.nilable(DeferredEnum), sensitivity: ['private']
+        prop :custom, T.nilable(DeferredEnum), inspect: ->(_value) { raise 'must not inspect pending values' }
+      end
+      doc = klass.from_hash('stored' => 'unknown', 'secret' => 'unknown', 'custom' => 'unknown')
+      DeferredEnum.expects(:deserialize).never
+      [doc.inspect, doc.pretty_inspect].each do |output|
+        assert_includes(output, 'secret=<REDACTED private>')
+        assert_includes(output, 'custom=<pending enum>')
+        refute_includes(output, 'unknown')
+      end
+    end
+
+    it 'invalidates pending and resolved values only after successful writes on every setter path' do
+      %i[generated dynamic bound].each do |path|
+        doc = DeferredEnumDocument.from_hash('stored' => 'unknown')
+        write = lambda do |value|
+          case path
+          when :generated then doc.required = value
+          when :dynamic then doc.class.decorator.prop_set(doc, :required, value)
+          when :bound then doc.class.decorator.prop_rules(:required).fetch(:_bound_setter_proc).call(doc, value)
+          end
+        end
+        assert_raises(TypeError) { write.call('invalid') }
+        assert_equal('unknown', doc.serialize.fetch('stored'))
+        write.call(DeferredEnum::One)
+        assert_same(DeferredEnum::One, doc.required)
+        assert_equal('one', doc.serialize.fetch('stored'))
+        doc.deserialize('stored' => 'two')
+        assert_same(DeferredEnum::Two, doc.required)
+        write.call(DeferredEnum::One)
+        assert_same(DeferredEnum::One, doc.required)
+      end
+    end
+
+    it 'invalidates pending values through cached constructor setters' do
+      doc = DeferredEnumDocument.from_hash('stored' => 'unknown')
+      setter = doc.class.decorator.props_without_defaults.fetch(:required)
+      assert_raises(TypeError) { setter.call(doc, 'invalid') }
+      assert_equal('unknown', doc.serialize.fetch('stored'))
+      setter.call(doc, DeferredEnum::One)
+      assert_same(DeferredEnum::One, doc.required)
+
+      defaults = DeferredEnumDefaults.from_hash('defaulted' => 'unknown')
+      setter = defaults.class.decorator.props_with_defaults.fetch(:defaulted).bound_setter_proc
+      assert_raises(TypeError) { setter.call(defaults, 'invalid') }
+      assert_equal('unknown', defaults.serialize(false).fetch('defaulted'))
+      setter.call(defaults, DeferredEnum::Two)
+      assert_same(DeferredEnum::Two, defaults.defaulted)
+    end
+
+    it 'does not discard state when a frozen setter fails' do
+      doc = DeferredEnumDocument.from_hash('stored' => 'unknown').freeze
+      assert_raises(FrozenError) { doc.required = DeferredEnum::One }
+      assert_equal('unknown', doc.serialize.fetch('stored'))
+    end
+
+    it 'supports nil assignment and dynamic writes without accessors' do
+      doc = DeferredEnumDocument.from_hash('stored' => 'one', 'optional' => 'unknown', 'hidden' => 'unknown')
+      doc.optional = nil
+      doc.class.decorator.prop_set(doc, :hidden, DeferredEnum::Two)
+      assert_nil(doc.optional)
+      assert_same(DeferredEnum::Two, doc.class.decorator.prop_get(doc, :hidden))
+      refute(doc.respond_to?(:hidden))
+      assert_equal({'stored' => 'one', 'hidden' => 'two', 'label' => 'label'}, doc.serialize)
+    end
+
+    it 'copies sidecar containers independently for dup and clone, including frozen copies' do
+      original = DeferredEnumDocument.from_hash('stored' => 'one').freeze
+      [original.dup, original.clone].each do |copy|
+        refute_same(original.instance_variable_get(:@_lazy_enum_values), copy.instance_variable_get(:@_lazy_enum_values))
+        assert_same(DeferredEnum::One, copy.required)
+        assert(original.class.decorator.lazy_enum_pending?(original, :required))
+      end
+      replacement = original.dup
+      replacement.required = DeferredEnum::Two
+      assert_equal('one', original.serialize.fetch('stored'))
+      assert_equal('two', replacement.serialize.fetch('stored'))
+    end
+
+    it 'resets prior pending and resolved state on deserialization' do
+      doc = DeferredEnumDocument.from_hash('stored' => 'one', 'optional' => 'unknown')
+      assert_same(DeferredEnum::One, doc.required)
+      doc.deserialize('stored' => 'two', 'optional' => nil)
+      assert_same(DeferredEnum::Two, doc.required)
+      assert_nil(doc.optional)
+      doc.deserialize('stored' => 'one', 'optional' => 'one')
+      doc.deserialize('stored' => 'two')
+      assert_nil(doc.optional)
+      assert_raises(RuntimeError) { doc.deserialize({}) }
+    end
+
+    it 'keeps the representation chosen at load time when the policy changes' do
+      doc = DeferredEnumDocument.from_hash('stored' => 'unknown')
+      DeferredEnumDocument.decorator.eager_enums = true
+      assert_raises(KeyError) { DeferredEnumDocument.from_hash('stored' => 'unknown') }
+      assert_equal('unknown', doc.serialize.fetch('stored'))
+      assert_raises(KeyError) { doc.required }
+      doc.deserialize('stored' => 'one')
+      assert_nil(doc.instance_variable_get(:@_lazy_enum_values))
+      assert_same(DeferredEnum::One, doc.required)
+    end
+
+    it 'preserves defaults, factories, nilability, missing-required behavior, and constructor validation' do
+      doc = DeferredEnumDefaults.from_hash({})
+      assert_same(DeferredEnum::One, doc.defaulted)
+      assert_same(DeferredEnum::Two, doc.factory)
+      assert_nil(doc.optional)
+      assert_nil(doc.missing)
+      assert_raises(TypeError) { DeferredEnumDocument.new(required: 'unknown') }
+      assert_same(DeferredEnum::One, DeferredEnumDocument.new(required: DeferredEnum::One).required)
+    end
+
+    it 'constructs parents and nested collections eagerly but defers their enum leaves' do
+      raw = {'stored' => 'unknown'}
+      parent = DeferredEnumParent.from_hash('children' => [raw], 'by_name' => {'child' => raw})
+      child = parent.children.fetch(0)
+      assert_instance_of(DeferredEnumDocument, child)
+      child.label = 'changed'
+      assert_equal('unknown', parent.serialize.fetch('children').fetch(0).fetch('stored'))
+      assert_equal('unknown', parent.serialize.fetch('by_name').fetch('child').fetch('stored'))
+      assert_raises(KeyError) { child.required }
+    end
+
+    it 'leaves container and unusual union props ineligible' do
+      assert(EagerEnumContainers.props.values.none? { |rules| rules[:_lazy_enum] })
+      assert_raises(KeyError) { EagerEnumContainers.from_hash('array' => ['unknown'], 'hash' => {}, 'union' => 'text') }
+    end
+
+    it 'keeps ordinary serializable enum props eager by default' do
+      assert_raises(KeyError) { EnumStruct.from_hash('enum' => 'unknown') }
+      doc = DeferredEnumDocument.new(required: DeferredEnum::One)
+      DeferredEnumDocument.decorator.expects(:prop_get).never
+      assert_equal('label', doc.label)
+    end
+
+    it 'validates the exact new generated clauses and rejects changes to their helper calls' do
+      decorator = DeferredEnumDocument.decorator
+      %i[serialize deserialize].each do |mode|
+        source = decorator.send("generate_#{mode}_source")
+        T::Props::GeneratedCodeValidation.public_send("validate_#{mode}", source)
+        invalid = source.sub(/__t_props_(?:serialize_lazy_enum|store_lazy_enum)/, 'unexpected_call')
+        assert_raises(T::Props::GeneratedCodeValidation::ValidationError) do
+          T::Props::GeneratedCodeValidation.public_send("validate_#{mode}", invalid)
+        end
+      end
+    end
+  end
+
   describe 'generated code' do
     describe 'serialize' do
       it 'validates' do

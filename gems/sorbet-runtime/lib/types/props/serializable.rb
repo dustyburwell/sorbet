@@ -57,6 +57,10 @@ module T::Props::Serializable
   #  props on this instance.
   # @return [void]
   def deserialize(hash, strict=false)
+    decorator = self.class.decorator
+    if decorator.supports_lazy_enum_deserialization? || defined?(@_lazy_enum_values)
+      @_lazy_enum_values = decorator.lazy_enum_deserialization?(self) ? {} : nil
+    end
     begin
       hash_keys_matching_props = __t_props_generated_deserialize(hash)
     rescue => e
@@ -90,6 +94,29 @@ module T::Props::Serializable
         end
       end
     end
+  end
+
+  private def __t_props_store_lazy_enum(prop, raw)
+    raw = T::Props::Utils.deep_clone(raw)
+    raw.freeze
+    @_lazy_enum_values[prop] = [raw].freeze
+    nil
+  end
+
+  private def __t_props_serialize_lazy_enum(prop)
+    entry = @_lazy_enum_values.fetch(prop)
+    if entry.size == 1
+      raw = entry[0]
+      raw.is_a?(String) ? raw.dup : T::Props::Utils.deep_clone(raw)
+    else
+      T::Props::CustomType.checked_serialize(entry[1])
+    end
+  end
+
+  private def initialize_copy(other)
+    super
+    state = other.instance_variable_get(:@_lazy_enum_values)
+    @_lazy_enum_values = state.dup if state
   end
 
   private def __t_props_generated_deserialize(hash)

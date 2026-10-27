@@ -13,6 +13,15 @@ module T::Props::PrettyPrintable
       klass.all_props.sort.each do |prop|
         pp.breakable
         rules = klass.prop_rules(prop)
+        if rules[:_lazy_enum] && klass.lazy_enum_pending?(self, prop)
+          pp.text("#{prop}=")
+          if (sensitivity = rules[:sensitivity]) && !sensitivity.empty?
+            pp.text("<REDACTED #{sensitivity.join(', ')}>")
+          else
+            pp.text("<pending enum>")
+          end
+          next
+        end
         val = klass.get(self, prop, rules)
         pp.text("#{prop}=")
         if (custom_inspect = rules[:inspect])

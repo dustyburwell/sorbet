@@ -58,13 +58,24 @@ module T::Props
           # Don't serialize values that are nil to save space (both the
           # nil value itself and the field name in the serialized BSON
           # document)
-          <<~RUBY
+          clause = <<~RUBY
             if #{ivar_name}.nil?
               #{nil_asserter}
             else
               h[#{hash_key.inspect}] = #{transformed_val}
             end
           RUBY
+          if rules[:_lazy_enum]
+            <<~RUBY
+              if @_lazy_enum_values && @_lazy_enum_values.key?(#{prop.inspect})
+                h[#{hash_key.inspect}] = __t_props_serialize_lazy_enum(#{prop.inspect})
+              else
+                #{clause}
+              end
+            RUBY
+          else
+            clause
+          end
         end
 
         <<~RUBY

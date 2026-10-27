@@ -52,6 +52,138 @@ class Opus::Types::Test::Props::DecoratorTest < Critic::Unit::UnitTest
     prop :the_hash, T.nilable(T::Hash[String, CustomType])
   end
 
+  class AccessorEnum < T::Enum
+    enums do
+      Known = new('known')
+    end
+  end
+
+  module DeferredEnumAccessors
+    include T::Props::Plugin
+    module DecoratorMethods
+      def supports_lazy_enum_deserialization?
+        true
+      end
+
+      def lazy_enum_deserialization?(instance)
+        true
+      end
+    end
+  end
+
+  class EnumAccessorParent < T::InexactStruct
+    prop :value, AccessorEnum
+    prop :ordinary, String, default: 'ordinary'
+  end
+
+  class EnumAccessorChild < EnumAccessorParent
+    include DeferredEnumAccessors
+    prop :value, AccessorEnum, override: true
+  end
+
+  class CustomEnumAccessorChild < EnumAccessorChild
+    def value
+      :custom
+    end
+
+    def initialize_copy(other)
+      super
+      @copied = true
+    end
+    attr_reader :copied
+  end
+
+  module InheritedDeferredEnums
+    include DeferredEnumAccessors
+    module DecoratorMethods
+      def supports_lazy_enum_deserialization?
+        decorated_class != EagerInheritedEnumParent
+      end
+    end
+  end
+
+  class EagerInheritedEnumParent < T::InexactStruct
+    include InheritedDeferredEnums
+    prop :value, AccessorEnum
+  end
+
+  class DeferredInheritedEnumChild < EagerInheritedEnumParent; end
+
+  describe 'deferred enum execution' do
+    it 'preserves cross-file accessor dispatch in the Ruby VM' do
+      fixture = "#{__dir__}/../fixtures/lazy_enum_execution.rb"
+      result, status = Open3.capture2e('ruby', fixture)
+      assert(status.success?, "fixture failed (exit #{status.exitstatus}): #{result}")
+      assert_equal("PASS\n", result)
+    end
+
+    it 'preserves warmed cross-file accessor dispatch under YJIT' do
+      skip unless RUBY_VERSION >= '3.2' && defined?(RubyVM::YJIT)
+      fixture = "#{__dir__}/../fixtures/lazy_enum_execution.rb"
+      result, errors, status = Open3.capture3('ruby', '--yjit', '--yjit-stats', '--yjit-call-threshold=1', fixture, '--require-yjit')
+      assert(status.success?, "YJIT fixture failed (exit #{status.exitstatus}): #{result}\n#{errors}")
+      assert_equal("PASS\n", result)
+    end
+  end
+
+  describe 'deferred enum accessors' do
+    it 'regenerates only runtime-defined accessors when an inherited prop becomes eligible' do
+      assert_raises(KeyError) { EagerInheritedEnumParent.from_hash('value' => 'unknown') }
+      doc = DeferredInheritedEnumChild.from_hash('value' => 'unknown')
+      assert_raises(KeyError) { doc.value }
+      doc.value = AccessorEnum::Known
+      assert_same(AccessorEnum::Known, doc.value)
+      assert_equal('known', doc.serialize.fetch('value'))
+      doc.deserialize('value' => 'unknown')
+      setter = doc.class.decorator.props_without_defaults.fetch(:value)
+      setter.call(doc, AccessorEnum::Known)
+      assert_same(AccessorEnum::Known, doc.value)
+    end
+
+    it 'preserves a user-defined getter while dynamic reads remain typed' do
+      doc = CustomEnumAccessorChild.from_hash('value' => 'unknown')
+      assert_equal(:custom, doc.value)
+      assert_raises(KeyError) { doc.class.decorator.prop_get(doc, :value) }
+      copy = doc.dup
+      assert(copy.copied)
+      copy.value = AccessorEnum::Known
+      assert_equal('unknown', doc.serialize.fetch('value'))
+      assert_equal('known', copy.serialize.fetch('value'))
+    end
+
+    it 'checks a wrapping access guard before attempting conversion' do
+      doc = EnumAccessorChild.from_hash('value' => 'unknown')
+      guard = Module.new do
+        def value
+          raise 'restricted'
+        end
+      end
+      doc.singleton_class.prepend(guard)
+      AccessorEnum.expects(:deserialize).never
+      error = assert_raises(RuntimeError) { doc.value }
+      assert_equal('restricted', error.message)
+      assert_equal('ordinary', doc.ordinary)
+    end
+
+    it 'preserves custom setter validation and its pending value on rejection' do
+      klass = Class.new(EnumAccessorChild) do
+        prop :value, AccessorEnum, override: true, setter_validate: ->(_prop, _value) { raise 'rejected' }
+      end
+      doc = klass.from_hash('value' => 'unknown')
+      assert_raises(RuntimeError) { doc.value = AccessorEnum::Known }
+      assert_equal('unknown', doc.serialize.fetch('value'))
+    end
+
+    it 'uses the same resolver for inherited direct and dynamic access' do
+      klass = Class.new(EnumAccessorChild)
+      doc = klass.from_hash('value' => 'known')
+      assert_same(AccessorEnum::Known, doc.value)
+      assert_same(AccessorEnum::Known, klass.decorator.prop_get(doc, :value))
+      doc.value = AccessorEnum::Known
+      assert_empty(doc.instance_variable_get(:@_lazy_enum_values))
+    end
+  end
+
   describe 'typed arrays and hashes' do
     it 'can have string values' do
       doc = StringArrayAndHashStruct.new(
@@ -102,6 +234,12 @@ class Opus::Types::Test::Props::DecoratorTest < Critic::Unit::UnitTest
     it 'Validates prop options are symbols' do
       assert_prop_error(error: ArgumentError) do
         prop :foo, String, 'name' => 'mongoprop'
+      end
+    end
+
+    it 'does not expose a lazy prop option' do
+      assert_prop_error(/Invalid prop arg/) do
+        prop :value, AccessorEnum, lazy: true
       end
     end
 

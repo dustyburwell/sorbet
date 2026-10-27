@@ -53,6 +53,15 @@ module T::Props
             'val'
           )
           transformed_val = transformation || 'val'
+          if rules[:_lazy_enum]
+            transformed_val = <<~RUBY
+              if @_lazy_enum_values
+                __t_props_store_lazy_enum(#{prop.inspect}, val)
+              else
+                #{transformed_val}
+              end
+            RUBY
+          end
 
           nil_handler = generate_nil_handler(
             prop: prop,
